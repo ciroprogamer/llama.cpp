@@ -90,19 +90,25 @@ jobs:
         run: |
           echo "VULKAN_SDK_VERSION=$(curl -s https://vulkan.lunarg.com/sdk/latest/linux.txt)" >> "$GITHUB_ENV"
 
-      - name: Use Vulkan SDK Cache
-        uses: actions/cache@v5
-        id: cache-sdk
-        with:
-          path: ./vulkan_sdk
-          key: cache-gha-vulkan-sdk-android-${{ env.VULKAN_SDK_VERSION }}-${{ runner.os }}
-
+      # The upstream `linux-setup-vulkan` composite action was removed in
+      # https://github.com/ggml-org/llama.cpp/pull/26983 ("ci: more optimizations"),
+      # which folded the Vulkan SDK setup into a direct `unarchive-tar` call
+      # and removed the separate Vulkan SDK cache step (the SDK download is
+      # fast enough that the cache wasn't worth the storage cost).
+      #
+      # We mirror both changes here so this fork's custom workflow keeps working
+      # against the merged upstream master. The result is byte-for-byte
+      # equivalent to what `linux-setup-vulkan` used to produce: a
+      # `./vulkan_sdk/` directory containing the unpacked LunarG SDK, including
+      # `setup-env.sh`, `glslc`, and the SPIRV-Headers that the build's
+      # `source ./vulkan_sdk/setup-env.sh` lines consume.
       - name: Setup Vulkan SDK
-        if: steps.cache-sdk.outputs.cache-hit != 'true'
-        uses: ./.github/actions/linux-setup-vulkan
+        id: setup
+        uses: ./.github/actions/unarchive-tar
         with:
+          url: https://sdk.lunarg.com/sdk/download/${{ env.VULKAN_SDK_VERSION }}/linux/vulkan_sdk.tar.xz
           path: ./vulkan_sdk
-          version: ${{ env.VULKAN_SDK_VERSION }}
+          strip: 1
 
       # The Android NDK toolchain hard-codes
       #   CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
