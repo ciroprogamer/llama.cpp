@@ -779,6 +779,14 @@ struct vk_device_struct {
 
     bool serialize_submissions {};
 
+    // Persistent pipeline cache (opt-in via GGML_VK_PIPELINE_CACHE,
+    // implemented in ggml-vulkan.cpp).
+    vk::PipelineCache pipeline_cache {};
+    std::string pipeline_cache_path {};
+    bool pipeline_cache_failed {};
+    std::atomic<size_t> pipeline_cache_compiles {};
+    std::mutex pipeline_cache_mutex {};
+
     const ggml_cgraph * diag_cgraph {};
     int diag_prev_start = -1;
     int diag_prev_end = -1;
