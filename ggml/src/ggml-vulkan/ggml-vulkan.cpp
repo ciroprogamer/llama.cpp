@@ -5474,7 +5474,10 @@ void ggml_vk_instance_init() {
     uint32_t api_version = vk::enumerateInstanceVersion();
 
     if (api_version < VK_API_VERSION_1_2) {
-        std::cerr << "ggml_vulkan: Error: Vulkan 1.2 required." << std::endl;
+        std::cerr << "ggml_vulkan: Error: Vulkan 1.2 required, but the available loader/driver only reports "
+                  << VK_VERSION_MAJOR(api_version) << "." << VK_VERSION_MINOR(api_version) << "." << VK_VERSION_PATCH(api_version)
+                  << ". Update the device GPU driver (on Android, via the vendor OS update)."
+                  << " The Vulkan backend stays disabled and compute falls back to CPU." << std::endl;
         throw vk::SystemError(vk::Result::eErrorFeatureNotPresent, "Vulkan 1.2 required");
     }
 
@@ -5692,7 +5695,15 @@ void ggml_vk_instance_init() {
         }
 
         if (vk_instance.device_indices.empty()) {
-            GGML_LOG_INFO("ggml_vulkan: No devices found.\n");
+            if (!devices.empty()) {
+                // Only software rasterizers (Lavapipe/SwiftShader — also the Android
+                // emulator fallback path) are present.
+                GGML_LOG_INFO("ggml_vulkan: only CPU-type Vulkan devices found (software rasterizer); "
+                               "the Vulkan backend stays disabled for them by default. "
+                               "Force one with GGML_VK_VISIBLE_DEVICES=<n> if that is really what you want.\n");
+            } else {
+                GGML_LOG_INFO("ggml_vulkan: No devices found.\n");
+            }
             return;
         }
     }
@@ -16510,13 +16521,13 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
         ggml_vk_instance_init();
         return &reg;
     } catch (const vk::SystemError& e) {
-        VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: System error: " << e.what());
+        GGML_LOG_ERROR("ggml_vulkan: Vulkan backend unavailable (%s). Compute falls back to other backends (e.g. CPU).\n", e.what());
         return nullptr;
     } catch (const std::exception &e) {
-        VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: " << e.what());
+        GGML_LOG_ERROR("ggml_vulkan: Vulkan backend unavailable (%s). Compute falls back to other backends (e.g. CPU).\n", e.what());
         return nullptr;
     } catch (...) {
-        VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: unknown exception during Vulkan init");
+        GGML_LOG_ERROR("ggml_vulkan: Vulkan backend unavailable (unknown error). Compute falls back to other backends (e.g. CPU).\n");
         return nullptr;
     }
 }
