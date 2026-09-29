@@ -148,6 +148,35 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
     return vk_device_architecture::OTHER;
 }
 
+// ARM Mali driverInfo strings look like "1.3.2-... r49p0-01eac0 ..." — the "rNNp"
+// token encodes the driver series. VK_KHR_cooperative_matrix only became solid in
+// the r44 series; earlier Mali drivers that expose the extension are known to
+// generate broken pipelines. Returns 0 when the series cannot be determined.
+static uint32_t ggml_vk_mali_driver_series(const char * driver_info) {
+    if (driver_info == nullptr) {
+        return 0;
+    }
+    for (const char * c = driver_info; *c != '\0'; ++c) {
+        if (*c != 'r' && *c != 'R') {
+            continue;
+        }
+        const char * d = c + 1;
+        uint32_t value = 0;
+        uint32_t digits = 0;
+        while (*d >= '0' && *d <= '9') {
+            value = value * 10 + uint32_t(*d - '0');
+            ++d;
+            if (++digits > 2) {
+                break;
+            }
+        }
+        if (digits == 2 && *d == 'p') {
+            return value;
+        }
+    }
+    return 0;
+}
+
 bool ggml_vk_lightning_indexer_k_type_supported(ggml_type type) {
     return std::find(lightning_indexer_k_types.begin(), lightning_indexer_k_types.end(), type) != lightning_indexer_k_types.end();
 }
@@ -4752,6 +4781,30 @@ vk_device ggml_vk_get_device(size_t idx) {
             }
         }
 
+        // Mali (ARM) proprietary drivers expose VK_KHR_cooperative_matrix from the r44
+        // series; earlier drivers that advertise the extension are known to generate
+        // broken pipelines. Gate conservatively on the driver series parsed from
+        // driverInfo ("rNNp"). Override with GGML_VK_IGNORE_DRIVER_VERSION=1.
+        if (device->vendor_id == VK_VENDOR_ID_ARM && device->coopmat_support &&
+            getenv("GGML_VK_IGNORE_DRIVER_VERSION") == nullptr) {
+            const uint32_t mali_series = ggml_vk_mali_driver_series(driver_props.driverInfo.data());
+            if (mali_series != 0 && mali_series < 44) {
+                GGML_LOG_WARN("ggml_vulkan: Mali driver r%u < r44 ('%s'): cooperative matrix disabled for stability "
+                               "(override with GGML_VK_IGNORE_DRIVER_VERSION=1)\n",
+                               mali_series, device->properties.deviceName.data());
+                device->coopmat_support = false;
+                device->coopmat1_fa_support = false;
+                device->coopmat_acc_f32_support = false;
+                device->coopmat_acc_f16_support = false;
+                device->coopmat_bf16_support = false;
+                device->coopmat_support_16x16x16_f32acc = false;
+                device->coopmat_support_16x16x16_f16acc = false;
+                device->coopmat_m = 0;
+                device->coopmat_n = 0;
+                device->coopmat_k = 0;
+            }
+        }
+
         if (device->coopmat_support) {
             device_extensions.push_back("VK_KHR_cooperative_matrix");
         }
@@ -5358,6 +5411,10 @@ void ggml_vk_instance_init() {
                         case VK_VENDOR_ID_QUALCOMM:
                             driver_priorities[vk::DriverId::eQualcommProprietary] = 1;
                             driver_priorities[vk::DriverId::eMesaTurnip] = 2;
+                            break;
+                        case VK_VENDOR_ID_ARM:
+                            driver_priorities[vk::DriverId::eArmProprietary] = 1;
+                            driver_priorities[vk::DriverId::eMesaPanvk] = 2;
                             break;
                     }
                     driver_priorities[vk::DriverId::eMesaDozen] = 100;
