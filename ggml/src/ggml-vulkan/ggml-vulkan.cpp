@@ -12317,6 +12317,29 @@ void ggml_vk_leaky_relu(ggml_backend_vk_context * ctx, vk_context& subctx, const
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_LEAKY_RELU, std::move(p));
 }
 
+// Allocate a staging buffer for graph compute. On failure, log actionable context
+// (sizes, device limits, tuning knobs) and raise ggml_vk_staging_alloc_error so
+// ggml_backend_vk_graph_compute can convert it into GGML_STATUS_ALLOC_FAILED
+// instead of letting the exception cross the C callback boundary and terminate
+// the process.
+static vk_buffer ggml_vk_alloc_staging(ggml_backend_vk_context * ctx, size_t size, const char * name) {
+    try {
+        return ggml_vk_create_buffer_device(ctx->device, size);
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_ERROR("ggml_vulkan: staging buffer allocation failed (%s): requested %s, max memory allocation %s, "
+                        "max buffer size %s, device '%s': %s\n",
+                        name,
+                        ggml_vk_format_size(size).c_str(),
+                        ggml_vk_format_size(ctx->device->max_memory_allocation_size).c_str(),
+                        ggml_vk_format_size(ctx->device->max_buffer_size).c_str(),
+                        ctx->device->properties.deviceName.data(),
+                        e.what());
+        GGML_LOG_ERROR("ggml_vulkan: try a smaller batch size (-b) / fewer offloaded layers (-ngl) / a smaller model, "
+                        "or GGML_VK_ALLOW_SYSMEM_FALLBACK=1 with a smaller GGML_VK_SUBALLOCATION_BLOCK_SIZE\n");
+        throw ggml_vk_staging_alloc_error(std::string("ggml_vulkan: staging buffer allocation failed (") + name + ")");
+    }
+}
+
 void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx) {
 #if defined(GGML_VULKAN_RUN_TESTS)
     const std::vector<size_t> vals {
@@ -12424,7 +12447,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         if (ctx->prealloc_x != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_x);
         }
-        ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_x);
+        ctx->prealloc_x = ggml_vk_alloc_staging(ctx, ctx->prealloc_size_x, "mul_mat x (activations)");
     }
     if (ctx->prealloc_y == nullptr || (ctx->prealloc_size_y > 0 && ctx->prealloc_y->size < ctx->prealloc_size_y)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(y_size: " << ctx->prealloc_size_y << ")");
@@ -12432,7 +12455,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         if (ctx->prealloc_y != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_y);
         }
-        ctx->prealloc_y = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_y);
+        ctx->prealloc_y = ggml_vk_alloc_staging(ctx, ctx->prealloc_size_y, "mul_mat y (weights)");
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
         ctx->prealloc_y_last_k_padded = false;
@@ -12443,7 +12466,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         if (ctx->prealloc_split_k != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_split_k);
         }
-        ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k);
+        ctx->prealloc_split_k = ggml_vk_alloc_staging(ctx, ctx->prealloc_size_split_k, "split_k reduction");
     }
     if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
@@ -12451,7 +12474,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         if (ctx->prealloc_add_rms_partials != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
         }
-        ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials);
+        ctx->prealloc_add_rms_partials = ggml_vk_alloc_staging(ctx, ctx->prealloc_size_add_rms_partials, "add_rms fusion partials");
     }
 }
 
@@ -14456,7 +14479,7 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
-static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
@@ -14960,6 +14983,36 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     UNUSED(backend);
 }
 
+// Converts everything the impl can throw (device lost, staging-buffer OOM, lazy
+// pipeline compile failures) into a ggml_status instead of letting the exception
+// cross the C callback boundary, which would terminate the process.
+static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    try {
+        const ggml_status status = ggml_backend_vk_graph_compute_impl(backend, cgraph);
+        ggml_vk_pipeline_cache_save(*ctx->device, false);
+        return status;
+    } catch (const ggml_vk_staging_alloc_error & e) {
+        GGML_LOG_ERROR("ggml_vulkan: graph compute aborted: %s (GGML_STATUS_ALLOC_FAILED)\n", e.what());
+        ggml_vk_pipeline_cache_save(*ctx->device, true);
+        return GGML_STATUS_ALLOC_FAILED;
+    } catch (const vk::DeviceLostError & e) {
+        GGML_LOG_ERROR("ggml_vulkan: device lost during graph compute on '%s': %s (GGML_STATUS_FAILED)\n",
+                       ctx->device->properties.deviceName.data(), e.what());
+        ggml_vk_pipeline_cache_save(*ctx->device, true);
+        return GGML_STATUS_FAILED;
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_ERROR("ggml_vulkan: graph compute failed: %s (GGML_STATUS_FAILED)\n", e.what());
+        ggml_vk_pipeline_cache_save(*ctx->device, true);
+        return GGML_STATUS_FAILED;
+    } catch (const std::exception & e) {
+        // Covers compute pipeline creation failures (already logged at the throw site).
+        GGML_LOG_ERROR("ggml_vulkan: graph compute failed: %s (GGML_STATUS_FAILED)\n", e.what());
+        ggml_vk_pipeline_cache_save(*ctx->device, true);
+        return GGML_STATUS_FAILED;
+    }
+}
+
 void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
 {
     VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
@@ -15431,7 +15484,18 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
     VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
 
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
-    ggml_vk_init(ctx, dev_num);
+    try {
+        ggml_vk_init(ctx, dev_num);
+    } catch (const std::exception & e) {
+        delete ctx;
+        GGML_LOG_ERROR("ggml_vulkan: failed to initialize Vulkan device %zu: %s — backend unavailable\n",
+                       dev_num, e.what());
+        return nullptr;
+    } catch (...) {
+        delete ctx;
+        GGML_LOG_ERROR("ggml_vulkan: failed to initialize Vulkan device %zu: unknown error — backend unavailable\n", dev_num);
+        return nullptr;
+    }
 
     ggml_backend_t vk_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_vk_guid(),
